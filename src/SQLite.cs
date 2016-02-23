@@ -267,6 +267,24 @@ namespace SQLite
 		}
 #endif
 
+	public void SetPassword(string key)
+	{
+		SQLite3.Result r = SQLite3.Key(Handle, key, key.Length);
+		if (r != SQLite3.Result.OK) {
+			string msg = SQLite3.GetErrmsg(Handle);
+			throw SQLiteException.New(r, msg);
+		}
+	}
+
+	public void ChangePassword(string key)
+	{
+		SQLite3.Result r = SQLite3.Rekey(Handle, key, key.Length);
+		if (r != SQLite3.Result.OK) {
+			string msg = SQLite3.GetErrmsg(Handle);
+			throw SQLiteException.New(r, msg);
+		}
+	}
+
         /// <summary>
 		/// Sets a busy handler to sleep the specified amount of time when a table is locked.
 		/// The handler will sleep multiple times until a total time of <see cref="BusyTimeout"/> has accumulated.
@@ -3271,6 +3289,12 @@ namespace SQLite
 
 		[DllImport (LibraryPath, EntryPoint = "sqlite3_libversion_number", CallingConvention = CallingConvention.Cdecl)]
 		public static extern int LibVersionNumber ();
+
+		[DllImport(LibraryPath, EntryPoint = "sqlite3_key", CallingConvention = CallingConvention.Cdecl)]
+		public static extern Result Key(IntPtr db, [MarshalAs(UnmanagedType.LPStr)] string pKey, int nkey);
+
+		[DllImport(LibraryPath, EntryPoint = "sqlite3_rekey", CallingConvention = CallingConvention.Cdecl)]
+		public static extern Result Rekey(IntPtr db, [MarshalAs(UnmanagedType.LPStr)] string pKey, int nkey);
 #else
 		public static Result Open(string filename, out Sqlite3DatabaseHandle db)
 		{
