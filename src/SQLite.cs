@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2009-2015 Krueger Systems, Inc.
+// Copyright (c) 2009-2016 Krueger Systems, Inc.
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -23,7 +23,7 @@
 #define USE_CSHARP_SQLITE
 #endif
 
-#if NETFX_CORE
+#if NETFX_CORE || NETCORE
 #define USE_NEW_REFLECTION_API
 #endif
 
@@ -60,6 +60,8 @@ using Sqlite3 = SQLitePCL.raw;
 using Sqlite3DatabaseHandle = System.IntPtr;
 using Sqlite3Statement = System.IntPtr;
 #endif
+
+#pragma warning disable 1591 // XML Doc Comments
 
 namespace SQLite
 {
@@ -162,6 +164,13 @@ namespace SQLite
 		public bool Trace { get; set; }
 
 		public bool StoreDateTimeAsTicks { get; private set; }
+
+#if USE_SQLITEPCL_RAW
+		static SQLiteConnection()
+		{
+			SQLitePCL.Batteries_V2.Init();
+		}
+#endif
 
 		/// <summary>
 		/// Constructs a new SQLiteConnection and opens a SQLite database specified by databasePath.
@@ -1071,7 +1080,7 @@ namespace SQLite
 				if (Int32.TryParse (savepoint.Substring (firstLen + 1), out depth)) {
 					// TODO: Mild race here, but inescapable without locking almost everywhere.
 					if (0 <= depth && depth < _transactionDepth) {
-#if NETFX_CORE || USE_SQLITEPCL_RAW
+#if NETFX_CORE || USE_SQLITEPCL_RAW || NETCORE
                         Volatile.Write (ref _transactionDepth, depth);
 #elif SILVERLIGHT
 						_transactionDepth = depth;
@@ -1658,7 +1667,7 @@ namespace SQLite
 	/// <summary>
 	/// Represents a parsed connection string.
 	/// </summary>
-	class SQLiteConnectionString
+	public class SQLiteConnectionString
 	{
 		public string ConnectionString { get; private set; }
 		public string DatabasePath { get; private set; }
@@ -1666,17 +1675,32 @@ namespace SQLite
 
 #if NETFX_CORE
 		static readonly string MetroStyleDataPath = Windows.Storage.ApplicationData.Current.LocalFolder.Path;
+
+        public static readonly string[] InMemoryDbPaths = new[]
+        {
+            ":memory:",
+            "file::memory:"
+        };
+
+        public static bool IsInMemoryPath(string databasePath)
+        {
+            return InMemoryDbPaths.Any(i => i.Equals(databasePath, StringComparison.OrdinalIgnoreCase));
+        }
+
 #endif
 
-		public SQLiteConnectionString (string databasePath, bool storeDateTimeAsTicks)
+        public SQLiteConnectionString (string databasePath, bool storeDateTimeAsTicks)
 		{
 			ConnectionString = databasePath;
 			StoreDateTimeAsTicks = storeDateTimeAsTicks;
 
 #if NETFX_CORE
-			DatabasePath = System.IO.Path.Combine (MetroStyleDataPath, databasePath);
+			DatabasePath = IsInMemoryPath(databasePath)
+                ? databasePath
+                : System.IO.Path.Combine(MetroStyleDataPath, databasePath);
+
 #else
-			DatabasePath = databasePath;
+            DatabasePath = databasePath;
 #endif
 		}
 	}
@@ -1772,7 +1796,12 @@ namespace SQLite
 	{
 	}
 
-	public class TableMapping
+    [AttributeUsage(AttributeTargets.Enum)]
+    public class StoreAsTextAttribute : Attribute
+    {
+    }
+
+    public class TableMapping
 	{
 		public Type MappedType { get; private set; }
 
@@ -1876,7 +1905,7 @@ namespace SQLite
 
 		public Column FindColumn (string columnName)
 		{
-			var exact = Columns.FirstOrDefault (c => c.Name == columnName);
+			var exact = Columns.FirstOrDefault (c => c.Name.ToLower() == columnName.ToLower());
 			return exact;
 		}
 
@@ -1958,6 +1987,8 @@ namespace SQLite
 
 			public int? MaxStringLength { get; private set; }
 
+            public bool StoreAsText { get; private set; }
+
             public Column(PropertyInfo prop, CreateFlags createFlags = CreateFlags.None)
             {
                 var colAttr = (ColumnAttribute)prop.GetCustomAttributes(typeof(ColumnAttribute), true).FirstOrDefault();
@@ -1987,6 +2018,8 @@ namespace SQLite
                 }
                 IsNullable = !(IsPK || Orm.IsMarkedNotNull(prop));
                 MaxStringLength = Orm.MaxStringLength(prop);
+
+                StoreAsText = prop.PropertyType.GetTypeInfo().GetCustomAttribute(typeof(StoreAsTextAttribute), false) != null;
             }
 
 			public void SetValue (object obj, object val)
@@ -2000,6 +2033,62 @@ namespace SQLite
 			}
 		}
 	}
+
+    internal class EnumCacheInfo
+    {
+        public EnumCacheInfo(Type type)
+        {
+#if !USE_NEW_REFLECTION_API
+            IsEnum = type.IsEnum;
+#else
+            IsEnum = type.GetTypeInfo().IsEnum;
+#endif
+
+            if (IsEnum)
+            {
+                // This is a big assumption, but for now support ints only as key, otherwise we still
+                // have to pay the price for boxing
+                EnumValues = Enum.GetValues(type).Cast<int>().ToDictionary(x => x, x => x.ToString());
+
+#if !USE_NEW_REFLECTION_API
+                StoreAsText = type.GetCustomAttribute(typeof(StoreAsTextAttribute), false) != null;
+#else
+                StoreAsText = type.GetTypeInfo().GetCustomAttribute(typeof(StoreAsTextAttribute), false) != null;
+#endif
+            }
+        }
+
+        public bool IsEnum { get; private set; }
+
+        public bool StoreAsText { get; private set; }
+
+        public Dictionary<int, string> EnumValues { get; private set; }
+    }
+
+    internal static class EnumCache
+    {
+        private static readonly Dictionary<Type, EnumCacheInfo> Cache = new Dictionary<Type, EnumCacheInfo>();
+
+        public static EnumCacheInfo GetInfo<T>()
+        {
+            return GetInfo(typeof(T));
+        }
+
+        public static EnumCacheInfo GetInfo(Type type)
+        {
+            lock (Cache)
+            {
+                EnumCacheInfo info = null;
+                if (!Cache.TryGetValue(type, out info))
+                {
+                    info = new EnumCacheInfo(type);
+                    Cache[type] = info;
+                }
+
+                return info;
+            }
+        }
+    }
 
 	public static class Orm
 	{
@@ -2053,7 +2142,10 @@ namespace SQLite
 #else
 			} else if (clrType.GetTypeInfo().IsEnum) {
 #endif
-				return "integer";
+                if (p.StoreAsText)
+                    return "varchar";
+                else
+                    return "integer";
 			} else if (clrType == typeof(byte[])) {
 				return "blob";
             } else if (clrType == typeof(Guid)) {
@@ -2321,6 +2413,8 @@ namespace SQLite
 
 		internal static IntPtr NegativePointer = new IntPtr (-1);
 
+		const string DateTimeExactStoreFormat = "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff";
+
 		internal static void BindParameter (Sqlite3Statement stmt, int index, object value, bool storeDateTimeAsTicks)
 		{
 			if (value == null) {
@@ -2345,23 +2439,28 @@ namespace SQLite
 						SQLite3.BindInt64 (stmt, index, ((DateTime)value).Ticks);
 					}
 					else {
-						SQLite3.BindText (stmt, index, ((DateTime)value).ToString ("yyyy-MM-dd HH:mm:ss"), -1, NegativePointer);
+						SQLite3.BindText (stmt, index, ((DateTime)value).ToString (DateTimeExactStoreFormat, System.Globalization.CultureInfo.InvariantCulture), -1, NegativePointer);
 					}
 				} else if (value is DateTimeOffset) {
 					SQLite3.BindInt64 (stmt, index, ((DateTimeOffset)value).UtcTicks);
-#if !USE_NEW_REFLECTION_API
-				} else if (value.GetType().IsEnum) {
-#else
-				} else if (value.GetType().GetTypeInfo().IsEnum) {
-#endif
-					SQLite3.BindInt (stmt, index, Convert.ToInt32 (value));
-                } else if (value is byte[]){
-                    SQLite3.BindBlob(stmt, index, (byte[]) value, ((byte[]) value).Length, NegativePointer);
-                } else if (value is Guid) {
-                    SQLite3.BindText(stmt, index, ((Guid)value).ToString(), 72, NegativePointer);
                 } else {
-                    throw new NotSupportedException("Cannot store type: " + value.GetType());
-                }
+				    // Now we could possibly get an enum, retrieve cached info
+			        var valueType = value.GetType();
+			        var enumInfo = EnumCache.GetInfo(valueType);
+			        if (enumInfo.IsEnum) {
+                        var enumIntValue = Convert.ToInt32(value);
+                        if (enumInfo.StoreAsText)
+                            SQLite3.BindText(stmt, index, enumInfo.EnumValues[enumIntValue], -1, NegativePointer);
+                        else
+                            SQLite3.BindInt(stmt, index, enumIntValue);
+                    } else if (value is byte[]){
+                        SQLite3.BindBlob(stmt, index, (byte[]) value, ((byte[]) value).Length, NegativePointer);
+                    } else if (value is Guid) {
+                        SQLite3.BindText(stmt, index, ((Guid)value).ToString(), 72, NegativePointer);
+                    } else {
+                        throw new NotSupportedException("Cannot store type: " + value.GetType());
+                    }
+				}
 			}
 		}
 
@@ -2397,7 +2496,11 @@ namespace SQLite
 					}
 					else {
 						var text = SQLite3.ColumnString (stmt, index);
-						return DateTime.Parse (text);
+						DateTime resultDate;
+						if (!DateTime.TryParseExact (text, DateTimeExactStoreFormat, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out resultDate)) {
+							resultDate = DateTime.Parse (text);
+						}
+						return resultDate;
 					}
 				} else if (clrType == typeof(DateTimeOffset)) {
 					return new DateTimeOffset(SQLite3.ColumnInt64 (stmt, index),TimeSpan.Zero);
@@ -2406,7 +2509,13 @@ namespace SQLite
 #else
 				} else if (clrType.GetTypeInfo().IsEnum) {
 #endif
-					return SQLite3.ColumnInt (stmt, index);
+                    if (type == SQLite3.ColType.Text)
+                    {
+                        var value = SQLite3.ColumnString(stmt, index);
+                        return Enum.Parse(clrType, value.ToString(), true);
+                    }
+                    else
+                        return SQLite3.ColumnInt (stmt, index);
 				} else if (clrType == typeof(Int64)) {
 					return SQLite3.ColumnInt64 (stmt, index);
 				} else if (clrType == typeof(UInt32)) {
@@ -3027,6 +3136,16 @@ namespace SQLite
 		{
 			var query = Take (1);
 			return query.ToList<T>().FirstOrDefault ();
+		}
+
+		public T First (Expression<Func<T, bool>> predExpr)
+		{
+			return Where (predExpr).First ();
+		}
+
+		public T FirstOrDefault (Expression<Func<T, bool>> predExpr)
+		{
+			return Where (predExpr).FirstOrDefault ();
 		}
     }
 
